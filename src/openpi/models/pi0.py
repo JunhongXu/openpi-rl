@@ -12,6 +12,7 @@ from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
+from openpi.models.token_dropout import TokenDropout
 
 logger = logging.getLogger("openpi")
 
@@ -101,10 +102,14 @@ class Pi0(_model.BaseModel):
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+        if config.token_dropout:
+            self.token_dropout = TokenDropout(rngs=rngs)
+        else:
+            self.token_dropout = None
 
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation
+        self, obs: _model.Observation, rng: at.KeyArrayLike | None = None
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
@@ -123,7 +128,6 @@ class Pi0(_model.BaseModel):
             )
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
-
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
@@ -132,6 +136,10 @@ class Pi0(_model.BaseModel):
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
+        # if self.token_dropout is not None:
+        if self.token_dropout is not None and rng is not None:
+            dropout_level = jax.random.uniform(rng, shape=tokens.shape[:2], minval=0.0, maxval=1.0)
+            tokens = self.token_dropout(tokens, dropout_level=dropout_level)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
@@ -189,7 +197,7 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, noise_rng, time_rng, dropout_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
@@ -200,7 +208,13 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        if self.token_dropout is not None:
+            dropout_level = jax.random.uniform(
+                dropout_rng, shape=batch_shape, minval=0.0, maxval=1.0
+            )
+        else:
+            dropout_level = None
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, rng=dropout_rng)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
@@ -222,16 +236,17 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        noise_rng, dropout_rng = jax.random.split(rng, 2)
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            noise = jax.random.normal(noise_rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, rng=dropout_rng)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
