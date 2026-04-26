@@ -1,4 +1,4 @@
-# openpi
+# Multi-Task Reinforcement Learning for OpenPi in RoboCasa Environments 
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
 
